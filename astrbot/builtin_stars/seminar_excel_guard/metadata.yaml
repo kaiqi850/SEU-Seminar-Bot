@@ -1,0 +1,6 @@
+name: seminar_excel_guard
+desc: >-
+  Check seminar_excel rows and privately remind speakers when required
+  information is missing, resolving speakers from the configured group members.
+author: AstrBot Team
+version: 0.1.0

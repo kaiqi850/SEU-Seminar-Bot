@@ -1,0 +1,9 @@
+name: seminar_excel_reader
+desc: >-
+  Read the seminar table from a Feishu/Lark cloud spreadsheet or bitable (share
+  link with /sheets/ or /base/ in the message) or from a group file attachment named like seminar_excel.
+  For cloud docs: grant the bot app spreadsheet or bitable permissions in Feishu open platform,
+  and ensure the doc title contains "seminar_excel" or type that phrase in the same
+  message as the link.
+author: AstrBot Team
+version: 0.3.0

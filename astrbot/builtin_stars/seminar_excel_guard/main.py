@@ -1,11 +1,21 @@
 """Remind seminar speakers when required seminar_excel information is missing."""
 
+import json
 import re
 from datetime import date, timedelta
 from typing import Any
+from uuid import uuid4
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.builtin_stars.seminar_excel_reader.main import (
+    _cfg_get,
+    _fetch_configured_sheet_values,
+    _find_column_for_label,
+    _parse_date_cell,
+    _row_value_for_label,
+    _trim_table,
+)
 from astrbot.core import logger
 from astrbot.core.config import AstrBotConfig
 from astrbot.core.platform.message_session import MessageSesion
@@ -15,19 +25,21 @@ from astrbot.core.platform.sources.lark.lark_members import (
     list_chat_members,
 )
 
-from astrbot.builtin_stars.seminar_excel_reader.main import (
-    _cfg_get,
-    _fetch_configured_sheet_values,
-    _find_column_for_label,
-    _parse_date_cell,
-    _row_value_for_label,
-    _trim_table,
-)
+try:
+    from lark_oapi.api.im.v1 import (
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+    )
+except Exception:  # pragma: no cover
+    CreateMessageRequest = None  # type: ignore[assignment]
+    CreateMessageRequestBody = None  # type: ignore[assignment]
 
 _INFO_JOB_NAME = "seminar_excel_guard_info_check"
+_WEEKDAY_JOB_NAME = "seminar_excel_guard_weekday_check"
 _DEFAULT_REQUIRED_INFO_LABELS = ("时间", "地点", "论文", "会议/期刊", "论文链接", "PPT")
 _BRACKET_TEXT_RE = re.compile(r"[（(【\[].*?[）)】\]]")
 _NAME_SEPARATORS = ("-", "_", "｜", "|", "/", "\\", "@", " ")
+_LARK_NO_AVAILABILITY_CODE = 230013
 
 
 def _clean_label(label: object) -> str:
@@ -99,6 +111,49 @@ def _rows_before_deadline(
     return headers, rows
 
 
+def _rows_on_day(
+    values: list[list],
+    *,
+    target_day: date,
+) -> tuple[list[str], list[list[str]]]:
+    table = _trim_table(values)
+    if len(table) < 2:
+        return [], []
+    headers = table[0]
+    rows: list[list[str]] = []
+    for row in table[1:]:
+        row_day = _row_date(row, headers)
+        if row_day == target_day:
+            rows.append(row)
+    return headers, rows
+
+
+def _meeting_weekday(plugin_cfg: AstrBotConfig | dict | None) -> int:
+    raw: object = _cfg_get(plugin_cfg, "meeting_weekday", 5)
+    if raw is None:
+        return 5
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 5
+    if value < 1 or value > 7:
+        return 5
+    return value
+
+
+def _weekday_name(weekday: int) -> str:
+    names = {
+        1: "周一",
+        2: "周二",
+        3: "周三",
+        4: "周四",
+        5: "周五",
+        6: "周六",
+        7: "周日",
+    }
+    return names.get(weekday, f"周{weekday}")
+
+
 def _group_chat_id_from_session(
     group_session: str,
 ) -> tuple[str, str] | tuple[None, None]:
@@ -114,7 +169,9 @@ def _group_chat_id_from_session(
     return session.platform_name, chat_id
 
 
-def _get_lark_client_for_platform(context: star.Context, platform_id: str) -> Any | None:
+def _get_lark_client_for_platform(
+    context: star.Context, platform_id: str
+) -> Any | None:
     for inst in context.platform_manager.platform_insts:
         if inst.meta().id != platform_id:
             continue
@@ -124,14 +181,64 @@ def _get_lark_client_for_platform(context: star.Context, platform_id: str) -> An
     return None
 
 
+def _parse_friend_open_id(session: str) -> tuple[str | None, str | None]:
+    try:
+        parsed = MessageSesion.from_str(session)
+    except Exception:
+        return None, None
+    if parsed.message_type != MessageType.FRIEND_MESSAGE:
+        return None, None
+    return parsed.platform_name, parsed.session_id
+
+
+async def _send_lark_text_message(
+    *,
+    lark_client: Any,
+    receive_id: str,
+    receive_id_type: str,
+    text: str,
+) -> tuple[bool, int | None]:
+    if CreateMessageRequest is None or CreateMessageRequestBody is None:
+        return False, None
+    if getattr(lark_client, "im", None) is None:
+        return False, None
+    try:
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .content(content)
+                .msg_type("text")
+                .uuid(str(uuid4()))
+                .build()
+            )
+            .build()
+        )
+        response = await lark_client.im.v1.message.acreate(request)
+    except Exception:
+        logger.warning(
+            "[seminar_excel_guard] failed to send lark text message",
+            exc_info=True,
+        )
+        return False, None
+
+    if not response.success():
+        try:
+            return False, int(response.code)
+        except Exception:
+            return False, None
+    return True, None
+
+
 def _normalize_member_name(name: str) -> str:
     text = _BRACKET_TEXT_RE.sub("", name)
     for sep in _NAME_SEPARATORS:
         text = text.replace(sep, "")
     return "".join(
-        ch
-        for ch in text.strip().lower()
-        if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+        ch for ch in text.strip().lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
     )
 
 
@@ -228,12 +335,33 @@ async def _safe_send(
         return False
 
 
+async def _safe_send_private_with_code(
+    context: star.Context,
+    session: str,
+    text: str,
+) -> tuple[bool, int | None]:
+    platform_id, open_id = _parse_friend_open_id(session)
+    if platform_id and open_id:
+        lark_client = _get_lark_client_for_platform(context, platform_id)
+        if lark_client is not None:
+            return await _send_lark_text_message(
+                lark_client=lark_client,
+                receive_id=open_id,
+                receive_id_type="open_id",
+                text=text,
+            )
+
+    ok = await _safe_send(context, session, text)
+    return ok, None
+
+
 async def check_missing_required_info(
     context: star.Context,
     plugin_cfg: AstrBotConfig | dict | None,
     *,
     reference_day: date | None = None,
 ) -> tuple[int, int]:
+    """Privately remind speakers only when tomorrow's row exists but is incomplete."""
     sheet = await _fetch_configured_sheet_values(context, plugin_cfg)
     if not sheet:
         logger.warning("[seminar_excel_guard] failed to load seminar spreadsheet")
@@ -246,7 +374,7 @@ async def check_missing_required_info(
 
     values, _doc_title = sheet
     today = reference_day or date.today()
-    notice_days = int(_cfg_get(plugin_cfg, "deadline_notice_days", 1) or 1)
+    tomorrow = today + timedelta(days=1)
     required_labels = _cfg_list(
         plugin_cfg,
         "required_info_labels",
@@ -255,13 +383,14 @@ async def check_missing_required_info(
     speaker_label = str(_cfg_get(plugin_cfg, "speaker_label", "汇报人") or "汇报人")
     speaker_aliases = _cfg_speaker_aliases(plugin_cfg)
 
-    headers, rows = _rows_before_deadline(
+    headers, rows = _rows_on_day(
         values,
-        reference_day=today,
-        notice_days=notice_days,
+        target_day=tomorrow,
     )
     sent = 0
     unresolved = 0
+    if not rows:
+        return 0, 0
     for row in rows:
         missing = _missing_labels(row, headers, required_labels)
         if not missing:
@@ -285,13 +414,33 @@ async def check_missing_required_info(
 
         seminar_time = _display_time(row, headers)
         text = (
-            f"{speaker}同学你好，seminar_excel 中你在 {seminar_time} 的组会信息还未填写完整。\n"
+            f"{speaker}同学你好，seminar_excel 中你在 {seminar_time} 的汇报信息还未填写完整。\n"
             f"目前缺少：{', '.join(missing)}。\n"
             "请在截止日期前补充到表格中，谢谢。"
         )
-        if await _safe_send(context, private_session, text):
+        ok, code = await _safe_send_private_with_code(context, private_session, text)
+        if ok:
             sent += 1
         else:
+            if code == _LARK_NO_AVAILABILITY_CODE:
+                platform_id, open_id = _parse_friend_open_id(private_session)
+                if open_id:
+                    group_text = (
+                        f"{speaker}同学，你在 {seminar_time} 的汇报信息还未填写完整。\n"
+                        f"目前缺少：{', '.join(missing)}。\n"
+                        "请尽快补充到云文档 seminar_excel。\n"
+                        "另外：检测到机器人暂时无法给你发私信，请先私聊机器人发送任意一句话（建立会话）。"
+                    )
+                    try:
+                        await context.send_message(
+                            group_session,
+                            MessageChain().at(speaker, open_id).message(group_text),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[seminar_excel_guard] failed to send group fallback @mention",
+                            exc_info=True,
+                        )
             unresolved += 1
 
     logger.info(
@@ -300,6 +449,58 @@ async def check_missing_required_info(
         unresolved,
     )
     return sent, unresolved
+
+
+async def send_weekday_group_guard_reminder(
+    context: star.Context,
+    plugin_cfg: AstrBotConfig | dict | None,
+    *,
+    reference_day: date | None = None,
+) -> bool:
+    """Only @all when tomorrow's row is missing (no private reminders here)."""
+    session = str(_cfg_get(plugin_cfg, "group_session", "") or "").strip()
+    if not session:
+        logger.warning("[seminar_excel_guard] group_session is not configured")
+        return False
+
+    today = reference_day or date.today()
+    tomorrow = today + timedelta(days=1)
+    target_weekday = _meeting_weekday(plugin_cfg)
+    if tomorrow.isoweekday() != target_weekday:
+        return False
+
+    sheet = await _fetch_configured_sheet_values(context, plugin_cfg)
+    if not sheet:
+        logger.warning("[seminar_excel_guard] failed to load seminar spreadsheet")
+        return False
+
+    values, _doc_title = sheet
+    headers, rows = _rows_on_day(values, target_day=tomorrow)
+
+    if rows:
+        return False
+
+    if not _cfg_get(plugin_cfg, "weekday_notify_when_no_row", True):
+        return False
+
+    text = (
+        f"同学们老师们大家好，下一次Seminar（{tomorrow.isoformat()}，{_weekday_name(target_weekday)}）汇报的同学"
+        "还没有在 seminar_excel 云文档中填写对应信息。"
+        "请该同学尽快补充表格信息，辛苦了。"
+    )
+    sent = await context.send_message(session, MessageChain().message(text).at_all())
+    if sent:
+        logger.info(
+            "[seminar_excel_guard] sent weekday @all reminder to %s for %s",
+            session,
+            tomorrow.isoformat(),
+        )
+    else:
+        logger.warning(
+            "[seminar_excel_guard] failed to send weekday @all reminder to %s",
+            session,
+        )
+    return sent
 
 
 class Main(star.Star):
@@ -311,13 +512,16 @@ class Main(star.Star):
         self.context = context
         self.plugin_config = config if config is not None else {}
         self._job_id: str | None = None
+        self._weekday_job_id: str | None = None
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
         await self._sync_cron_job()
+        await self._sync_weekday_cron_job()
 
     async def terminate(self) -> None:
         await self._remove_cron_job()
+        await self._remove_weekday_cron_job()
 
     async def _sync_cron_job(self) -> None:
         cron_mgr = self.context.cron_manager
@@ -328,7 +532,9 @@ class Main(star.Star):
         if not _cfg_get(self.plugin_config, "cron_enabled", True):
             return
         if not str(_cfg_get(self.plugin_config, "spreadsheet_url", "") or "").strip():
-            logger.warning("[seminar_excel_guard] cron enabled but spreadsheet_url empty")
+            logger.warning(
+                "[seminar_excel_guard] cron enabled but spreadsheet_url empty"
+            )
             return
         if not str(_cfg_get(self.plugin_config, "group_session", "") or "").strip():
             logger.warning("[seminar_excel_guard] cron enabled but group_session empty")
@@ -361,6 +567,61 @@ class Main(star.Star):
         except Exception:
             logger.exception("[seminar_excel_guard] failed to schedule cron job")
 
+    async def _sync_weekday_cron_job(self) -> None:
+        cron_mgr = self.context.cron_manager
+        if cron_mgr is None:
+            return
+        await self._remove_weekday_cron_job()
+
+        if not _cfg_get(self.plugin_config, "cron_enabled", True):
+            return
+        if not _cfg_get(self.plugin_config, "weekday_guard_enabled", True):
+            return
+        if not str(_cfg_get(self.plugin_config, "spreadsheet_url", "") or "").strip():
+            logger.warning(
+                "[seminar_excel_guard] weekday guard enabled but spreadsheet_url empty"
+            )
+            return
+        if not str(_cfg_get(self.plugin_config, "group_session", "") or "").strip():
+            logger.warning(
+                "[seminar_excel_guard] weekday guard enabled but group_session empty"
+            )
+            return
+
+        cron_expr = str(
+            _cfg_get(self.plugin_config, "weekday_check_cron_expression", "0 17 * * *")
+            or "0 17 * * *"
+        ).strip()
+        tz = str(
+            _cfg_get(self.plugin_config, "cron_timezone", "Asia/Shanghai")
+            or "Asia/Shanghai"
+        ).strip()
+
+        async def _handler() -> None:
+            await send_weekday_group_guard_reminder(self.context, self.plugin_config)
+
+        try:
+            job = await cron_mgr.add_basic_job(
+                name=_WEEKDAY_JOB_NAME,
+                cron_expression=cron_expr,
+                handler=_handler,
+                description=(
+                    "Before target weekday, @all if tomorrow seminar info is missing"
+                ),
+                timezone=tz,
+                enabled=True,
+                persistent=True,
+            )
+            self._weekday_job_id = job.job_id
+            logger.info(
+                "[seminar_excel_guard] scheduled weekday check cron job, meeting_weekday=%s",
+                _meeting_weekday(self.plugin_config),
+            )
+        except Exception:
+            logger.exception(
+                "[seminar_excel_guard] failed to schedule weekday cron job"
+            )
+
     async def _remove_cron_job(self) -> None:
         cron_mgr = self.context.cron_manager
         if cron_mgr is None:
@@ -374,6 +635,23 @@ class Main(star.Star):
         except Exception:
             logger.debug("[seminar_excel_guard] remove cron job failed", exc_info=True)
         self._job_id = None
+
+    async def _remove_weekday_cron_job(self) -> None:
+        cron_mgr = self.context.cron_manager
+        if cron_mgr is None:
+            return
+        try:
+            for job in await cron_mgr.list_jobs("basic"):
+                if job.name == _WEEKDAY_JOB_NAME:
+                    await cron_mgr.delete_job(job.job_id)
+            if self._weekday_job_id:
+                await cron_mgr.delete_job(self._weekday_job_id)
+        except Exception:
+            logger.debug(
+                "[seminar_excel_guard] remove weekday cron job failed",
+                exc_info=True,
+            )
+        self._weekday_job_id = None
 
     @filter.command("seminar_guard_check_info", alias={"seminar检查信息"})
     async def cmd_check_info(self, event: AstrMessageEvent):
@@ -394,7 +672,9 @@ class Main(star.Star):
         group_session = str(_cfg_get(self.plugin_config, "group_session", "") or "")
         platform_id, chat_id = _group_chat_id_from_session(group_session.strip())
         if not platform_id or not chat_id:
-            yield event.plain_result("group_session 不是有效的群会话 UMO。").stop_event()
+            yield event.plain_result(
+                "group_session 不是有效的群会话 UMO。"
+            ).stop_event()
             return
         lark_client = _get_lark_client_for_platform(self.context, platform_id)
         if lark_client is None:
@@ -410,4 +690,18 @@ class Main(star.Star):
         suffix = "…" if len(listed.members) > 50 else ""
         yield event.plain_result(
             f"已读取到 {len(listed.members)} 位群成员：{names}{suffix}"
+        ).stop_event()
+
+    @filter.command("seminar_guard_check_weekday", alias={"seminar星期提醒检查"})
+    async def cmd_check_weekday_reminder(self, event: AstrMessageEvent):
+        """Manually check and send weekday @all reminder if needed."""
+        event.should_call_llm(True)
+        sent = await send_weekday_group_guard_reminder(self.context, self.plugin_config)
+        if sent:
+            yield event.plain_result(
+                "星期提醒检查完成：已发送 @全体成员 提醒。"
+            ).stop_event()
+            return
+        yield event.plain_result(
+            "星期提醒检查完成：当前条件不满足，或明日汇报信息已完整。"
         ).stop_event()

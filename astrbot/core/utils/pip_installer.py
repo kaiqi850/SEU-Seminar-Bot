@@ -42,8 +42,7 @@ _PIP_FAILURE_PATTERNS = {
     "resolution_impossible": re.compile(r"\bresolutionimpossible\b", re.IGNORECASE),
     "cannot_install": re.compile(r"\bcannot install\b", re.IGNORECASE),
     "conflict": re.compile(r"\bconflict(?:ing|s)?\b", re.IGNORECASE),
-    "conflict_cause": re.compile(r"\bcaused by\b", re.IGNORECASE),
-    "constraint": re.compile(r"(?:\(\s*constraint\s*\)|\bconstraint\b)", re.IGNORECASE),
+    "constraint": re.compile(r"\(constraint\)", re.IGNORECASE),
     "dependency_detail": re.compile(r"\bdepends on\b", re.IGNORECASE),
 }
 _SENSITIVE_PIP_VALUE_KEYS = frozenset(
@@ -391,10 +390,7 @@ def _build_pip_conflict_context(output_lines: list[str]) -> PipConflictContext |
             if index in relevant_index_set
         ]
     else:
-        # Keep a slightly wider tail window as a fallback when keywords are sparse
-        # in pip output (for example, localized or non-standard formats).
-        fallback_window = max(5, min(_MAX_PIP_OUTPUT_LINES, 8))
-        relevant_output_lines = output_lines[-fallback_window:]
+        relevant_output_lines = output_lines[-5:]
 
     if not relevant_output_lines:
         return None
@@ -432,8 +428,7 @@ def _build_pip_conflict_context(output_lines: list[str]) -> PipConflictContext |
     )
 
     has_contextual_conflict_signal = any(
-        _matches_pip_failure_pattern(line, "conflict", "conflict_cause")
-        for line in relevant_output_lines
+        _matches_pip_failure_pattern(line, "conflict") for line in relevant_output_lines
     ) and bool(dependency_detail_lines or requested_lines or constraint_lines)
 
     return PipConflictContext(

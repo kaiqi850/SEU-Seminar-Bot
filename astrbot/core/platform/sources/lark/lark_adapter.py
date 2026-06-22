@@ -34,6 +34,57 @@ from .lark_event import LarkMessageEvent
 from .lark_members import remember_chat_member_name
 from .server import LarkWebhookServer
 
+_MEMBER_JOIN_EVENT_TYPES = {
+    # https://open.feishu.cn/document/ukTMukTMukTM/uAjNwYjLwYDM24CM2AjN
+    "im.chat.member.user.added_v1",
+}
+
+
+def _extract_lark_open_id(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("open_id", "user_id", "id"):
+            text = _extract_lark_open_id(value.get(key))
+            if text:
+                return text
+        return ""
+    text = _extract_lark_open_id(getattr(value, "open_id", None))
+    if text:
+        return text
+    text = _extract_lark_open_id(getattr(value, "user_id", None))
+    if text:
+        return text
+    return ""
+
+
+def _extract_lark_user_name(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("name", "user_name", "display_name", "chat_nickname"):
+            text = _extract_lark_user_name(value.get(key))
+            if text:
+                return text
+        nested = value.get("user")
+        if nested is not None:
+            return _extract_lark_user_name(nested)
+        return ""
+    text = _extract_lark_user_name(getattr(value, "name", None))
+    if text:
+        return text
+    text = _extract_lark_user_name(getattr(value, "user_name", None))
+    if text:
+        return text
+    text = _extract_lark_user_name(getattr(value, "display_name", None))
+    if text:
+        return text
+    return ""
+
 
 @register_platform_adapter(
     "lark", "飞书机器人官方 API 适配器", support_streaming_message=True
@@ -63,11 +114,50 @@ class LarkPlatformAdapter(Platform):
         def do_v2_msg_event(event: lark.im.v1.P2ImMessageReceiveV1) -> None:
             asyncio.create_task(on_msg_event_recv(event))
 
-        self.event_handler = (
-            lark.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(do_v2_msg_event)
-            .build()
-        )
+        async def on_member_join_event_recv(event: Any) -> None:
+            """Handle member-join events received via long-connection mode."""
+            try:
+                event_obj = getattr(event, "event", None)
+                chat_id = str(getattr(event_obj, "chat_id", "") or "").strip()
+                users_obj = getattr(event_obj, "users", None)
+                users: list[dict[str, Any]] = []
+                if isinstance(users_obj, list):
+                    for u in users_obj:
+                        if u is None:
+                            continue
+                        open_id = _extract_lark_open_id(u)
+                        name = _extract_lark_user_name(u)
+                        users.append(
+                            {
+                                "user_id": open_id,
+                                "open_id": open_id,
+                                "name": name,
+                            }
+                        )
+                await self._emit_member_join_synthetic_event(
+                    event_type="im.chat.member.user.added_v1",
+                    chat_id=chat_id,
+                    users=users,
+                    raw_event=event,
+                    event_id=str(
+                        getattr(getattr(event, "header", None), "event_id", "") or ""
+                    ),
+                )
+            except Exception:
+                logger.error("[Lark] failed to handle member join event", exc_info=True)
+
+        def do_v2_member_join_event(event: Any) -> None:
+            asyncio.create_task(on_member_join_event_recv(event))
+
+        builder = lark.EventDispatcherHandler.builder(
+            "", ""
+        ).register_p2_im_message_receive_v1(do_v2_msg_event)
+        # Not all SDK builds expose this API; register if available.
+        if hasattr(builder, "register_p2_im_chat_member_user_added_v1"):
+            builder = builder.register_p2_im_chat_member_user_added_v1(
+                do_v2_member_join_event
+            )
+        self.event_handler = builder.build()
 
         self.do_v2_msg_event = do_v2_msg_event
 
@@ -602,12 +692,13 @@ class LarkPlatformAdapter(Platform):
                 getattr(event.event.sender.sender_id, "name", "") or ""
             ).strip()
         if not sender_nickname:
-            sender_nickname = str(
-                getattr(event.event.sender, "name", "") or ""
-            ).strip()
+            sender_nickname = str(getattr(event.event.sender, "name", "") or "").strip()
         if not sender_nickname and message.mentions:
             for mention in message.mentions:
-                if mention.id and mention.id.open_id == event.event.sender.sender_id.open_id:
+                if (
+                    mention.id
+                    and mention.id.open_id == event.event.sender.sender_id.open_id
+                ):
                     sender_nickname = str(mention.name or "").strip()
                     if sender_nickname:
                         break
@@ -712,10 +803,98 @@ class LarkPlatformAdapter(Platform):
                 processor = P2ImMessageReceiveV1Processor(self.do_v2_msg_event)
                 data = (processor.type())(event_data)
                 processor.do(data)
+            elif event_type in _MEMBER_JOIN_EVENT_TYPES:
+                await self._handle_member_join_event(event_data)
             else:
                 logger.debug(f"[Lark Webhook] 未处理的事件类型: {event_type}")
         except Exception as e:
             logger.error(f"[Lark Webhook] 处理事件失败: {e}", exc_info=True)
+
+    async def _emit_member_join_synthetic_event(
+        self,
+        *,
+        event_type: str,
+        chat_id: str,
+        users: list[dict[str, Any]],
+        raw_event: Any,
+        event_id: str,
+    ) -> None:
+        chat_id = chat_id.strip()
+        if not chat_id or not users:
+            return
+
+        first = users[0] if isinstance(users[0], dict) else {}
+        open_id = _extract_lark_open_id(
+            first.get("open_id") or first.get("user_id") or first
+        )
+        if not open_id:
+            return
+
+        name = _extract_lark_user_name(first) or open_id[:8]
+        if chat_id:
+            remember_chat_member_name(chat_id, open_id, name)
+
+        abm = AstrBotMessage()
+        abm.type = MessageType.GROUP_MESSAGE
+        abm.group_id = chat_id
+        abm.session_id = chat_id
+        abm.self_id = self.bot_open_id or self.bot_name
+        abm.message_id = event_id or f"join-{uuid4().hex}"
+        abm.sender = MessageMember(user_id=open_id, nickname=name)
+        abm.message = []
+        abm.message_str = ""
+        abm.raw_message = raw_event
+
+        synthetic = LarkMessageEvent(
+            message_str=abm.message_str,
+            message_obj=abm,
+            platform_meta=self.meta(),
+            session_id=abm.session_id,
+            bot=self.lark_api,
+        )
+        synthetic.set_extra("_lark_member_join", True)
+        synthetic.set_extra("_lark_member_join_event_type", event_type)
+        synthetic.set_extra("_lark_member_join_users", users)
+        self._event_queue.put_nowait(synthetic)
+
+    async def _handle_member_join_event(self, event_data: dict) -> None:
+        """Convert member-join webhooks into a synthetic group message event."""
+        if not isinstance(event_data, dict):
+            return
+        header = event_data.get("header", {})
+        event_type = str(header.get("event_type", "") or "").strip()
+        event_id = str(header.get("event_id", "") or "").strip()
+
+        event = event_data.get("event")
+        if not isinstance(event, dict):
+            return
+        chat_id = str(event.get("chat_id") or "").strip()
+        users_raw = event.get("users")
+        users: list[dict[str, Any]] = []
+        if isinstance(users_raw, list):
+            for u in users_raw:
+                if isinstance(u, dict):
+                    open_id = _extract_lark_open_id(
+                        u.get("user_id") or u.get("open_id") or u
+                    )
+                    if not open_id:
+                        continue
+                    users.append(
+                        {
+                            "user_id": open_id,
+                            "open_id": open_id,
+                            "name": _extract_lark_user_name(u),
+                            "raw": u,
+                        }
+                    )
+
+        await self._emit_member_join_synthetic_event(
+            event_type=event_type or "im.chat.member.user.added_v1",
+            chat_id=chat_id,
+            users=users,
+            raw_event=event_data,
+            event_id=event_id,
+        )
 
     async def run(self) -> None:
         try:

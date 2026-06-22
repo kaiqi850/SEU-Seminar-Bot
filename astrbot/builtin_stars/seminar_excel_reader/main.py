@@ -661,6 +661,42 @@ async def _load_ppt_text(ppt_value: str) -> str:
     return ppt_value.strip()
 
 
+async def _load_reference_text(reference_value: str) -> str:
+    text = (reference_value or "").strip()
+    if not text:
+        return ""
+    urls = _HTTP_URL_RE.findall(text)
+    if not urls:
+        return text
+
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as http:
+                r = await http.get(url)
+            r.raise_for_status()
+            content_type = r.headers.get("content-type", "").lower()
+            filename = Path(urlparse(str(r.url)).path).name or "reference.html"
+            if not Path(filename).suffix:
+                if "pdf" in content_type:
+                    filename += ".pdf"
+                elif "html" in content_type:
+                    filename += ".html"
+            extracted = await asyncio.to_thread(
+                _read_markdown_from_bytes,
+                r.content,
+                filename,
+            )
+            if extracted:
+                return extracted
+        except Exception:
+            logger.debug(
+                "[seminar_excel_reader] failed to load reference text from %s",
+                url,
+                exc_info=True,
+            )
+    return text
+
+
 async def _summarize_paper_from_ppt(
     context: star.Context,
     ppt_text: str,
@@ -741,6 +777,24 @@ async def _build_natural_reminder_text(
             ppt_text,
             paper_title=paper_title,
             venue=venue,
+        )
+    else:
+        logger.info("[seminar_excel_reader] PPT field is empty, skip PPT summary source")
+    if not ppt_summary and paper_link:
+        logger.info(
+            "[seminar_excel_reader] PPT summary unavailable, fallback to paper link text"
+        )
+        paper_text = await _load_reference_text(paper_link)
+        ppt_summary = await _summarize_paper_from_ppt(
+            context,
+            paper_text,
+            paper_title=paper_title,
+            venue=venue,
+        )
+    if not ppt_summary:
+        logger.warning(
+            "[seminar_excel_reader] failed to build paper summary for title=%s",
+            paper_title or "<empty>",
         )
     if ppt_summary:
         paper_lines.append(f"论文简介：{ppt_summary}")

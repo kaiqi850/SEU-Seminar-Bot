@@ -1,0 +1,52 @@
+{
+  "group_session": {
+    "description": "用于欢迎新成员的群会话",
+    "type": "string",
+    "hint": "在目标群里对机器人发送 /sid，将返回的 UMO（整行，如 lark-seminar:GroupMessage:oc_xxx）粘贴到此处。",
+    "default": ""
+  },
+  "cron_enabled": {
+    "description": "启用自动欢迎",
+    "type": "bool",
+    "default": true
+  },
+  "use_join_event": {
+    "description": "使用飞书入群事件触发（推荐）",
+    "type": "bool",
+    "hint": "开启后将通过飞书 webhook 入群事件触发欢迎，不依赖轮询。",
+    "default": true
+  },
+  "cron_expression": {
+    "description": "检查新成员 Cron 表达式",
+    "type": "string",
+    "hint": "默认每 5 分钟检查一次群成员列表，发现新成员则欢迎并提醒填表。",
+    "default": "*/5 * * * *"
+  },
+  "cron_timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "welcome_on_first_sync": {
+    "description": "首次同步时也欢迎现有成员",
+    "type": "bool",
+    "hint": "默认关闭：第一次运行只记录当前成员，不发送欢迎，避免刷屏。",
+    "default": false
+  },
+  "seminar_excel_name": {
+    "description": "云文档名称",
+    "type": "string",
+    "default": "seminar_excel"
+  },
+  "fill_deadline_time": {
+    "description": "填写截止时间（前一天）",
+    "type": "string",
+    "hint": "仅用于文案展示，例如 20:00。",
+    "default": "20:00"
+  },
+  "welcome_text_prefix": {
+    "description": "欢迎语前缀",
+    "type": "string",
+    "default": "欢迎加入本群！"
+  }
+}

@@ -1,0 +1,6 @@
+name: seminar_welcome_guard
+desc: >-
+  Welcome new group members and remind them to fill seminar_excel before seminar.
+author: AstrBot Team
+version: 0.1.0
+

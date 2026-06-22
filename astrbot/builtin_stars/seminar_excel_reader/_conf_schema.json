@@ -1,0 +1,39 @@
+{
+  "spreadsheet_url": {
+    "description": "seminar_excel 云表格/多维表格链接",
+    "type": "string",
+    "hint": "在飞书中打开 seminar_excel 普通电子表格或多维表格，复制浏览器地址栏完整链接（包含 /sheets/ 或 /base/）。群内 @ 机器人要求读取时，若消息未带链接，将使用此处配置的文档。",
+    "default": ""
+  },
+  "group_session": {
+    "description": "定时提醒发送到的群会话",
+    "type": "string",
+    "hint": "在目标群里对机器人发送 /sid，将返回的 UMO（整行，如 lark-seminar:GroupMessage:oc_xxx）粘贴到此处。",
+    "default": ""
+  },
+  "cron_enabled": {
+    "description": "启用每晚自动提醒",
+    "type": "bool",
+    "default": true
+  },
+  "cron_expression": {
+    "description": "Cron 表达式（每天 19:30 为 30 19 * * *）",
+    "type": "string",
+    "default": "30 19 * * *"
+  },
+  "cron_timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "reminder_labels": {
+    "description": "定时提醒输出字段顺序",
+    "type": "list",
+    "default": ["汇报人", "时间", "地点", "论文", "会议/期刊", "论文链接"]
+  },
+  "cron_notify_when_empty": {
+    "description": "明天无会议时也在群里发提示",
+    "type": "bool",
+    "default": false
+  }
+}

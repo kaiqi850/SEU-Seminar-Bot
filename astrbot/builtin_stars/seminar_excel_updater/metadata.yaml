@@ -1,0 +1,6 @@
+name: seminar_excel_updater
+desc: >-
+  Update the seminar bitable from private Lark messages. Extract paper metadata
+  from a web link or PDF, ask for missing fields, and upload presentation PDFs.
+author: AstrBot Team
+version: 0.1.0

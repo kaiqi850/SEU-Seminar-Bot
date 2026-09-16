@@ -1,0 +1,60 @@
+{
+  "spreadsheet_url": {
+    "description": "seminar_excel 多维表格链接",
+    "type": "string",
+    "hint": "请填写包含 /base/、table 参数的飞书多维表格完整链接。自动写入目前仅支持多维表格。",
+    "default": ""
+  },
+  "group_session": {
+    "description": "用于识别私聊用户姓名的群会话",
+    "type": "string",
+    "hint": "在 Seminar 群中发送 /sid，把返回的完整 UMO 填入此处。",
+    "default": ""
+  },
+  "title_field": {
+    "description": "论文标题字段",
+    "type": "string",
+    "default": "论文标题"
+  },
+  "venue_field": {
+    "description": "会议/期刊字段",
+    "type": "string",
+    "default": "会议/期刊"
+  },
+  "speaker_field": {
+    "description": "汇报人字段",
+    "type": "string",
+    "default": "汇报人"
+  },
+  "paper_link_field": {
+    "description": "论文链接字段",
+    "type": "string",
+    "default": "论文链接"
+  },
+  "time_field": {
+    "description": "组会汇报时间字段",
+    "type": "string",
+    "default": "组会汇报时间"
+  },
+  "location_field": {
+    "description": "地点字段",
+    "type": "string",
+    "default": "地点"
+  },
+  "meeting_link_field": {
+    "description": "腾讯会议字段",
+    "type": "string",
+    "default": "腾讯会议"
+  },
+  "ppt_field": {
+    "description": "PPT PDF 附件字段",
+    "type": "string",
+    "hint": "可以只填写字段名前缀，例如 PPT；插件会自动匹配实际附件字段。",
+    "default": "PPT"
+  },
+  "max_pdf_mb": {
+    "description": "允许处理或上传的 PDF 大小上限（MB）",
+    "type": "int",
+    "default": 20
+  }
+}

@@ -5,6 +5,7 @@ import io
 import json
 import re
 from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -17,6 +18,7 @@ from lark_oapi.api.sheets.v3.model.query_spreadsheet_sheet_request import (
 from lark_oapi.core.model.config import Config
 from lark_oapi.core.token.manager import TokenManager
 from markitdown_no_magika import MarkItDown, StreamInfo
+from pypdf import PdfReader
 
 import astrbot.api.message_components as Comp
 from astrbot.api import star
@@ -330,8 +332,72 @@ def _read_excel_markdown(path: Path, original_name: str) -> str:
     return (result.markdown or "").strip()
 
 
+class _ReadableHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self._metadata: list[str] = []
+        self._text: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._ignored_depth += 1
+            return
+        if tag != "meta":
+            return
+        values = {key.casefold(): value or "" for key, value in attrs}
+        name = (values.get("name") or values.get("property") or "").casefold()
+        content = values.get("content", "").strip()
+        labels = {
+            "citation_title": "Title",
+            "citation_conference_title": "Conference",
+            "citation_journal_title": "Journal",
+            "citation_abstract": "Abstract",
+            "description": "Description",
+            "og:title": "Title",
+            "og:description": "Description",
+        }
+        if content and name in labels:
+            self._metadata.append(f"{labels[name]}: {content}")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        text = " ".join(data.split())
+        if text:
+            self._text.append(text)
+
+    def readable_text(self) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for part in [*self._metadata, *self._text]:
+            normalized = part.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            parts.append(part)
+        return "\n".join(parts).strip()
+
+
 def _read_markdown_from_bytes(data: bytes, filename: str) -> str:
     ext = Path(filename).suffix.lower()
+    if ext == ".pdf" or data.startswith(b"%PDF"):
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+        return "\n\n".join(page for page in pages if page).strip()
+    if ext in {".html", ".htm"}:
+        parser = _ReadableHtmlParser()
+        parser.feed(data.decode("utf-8", errors="replace"))
+        return parser.readable_text()
+
     md = MarkItDown(enable_plugins=False)
     bio = io.BytesIO(data)
     stream_info = StreamInfo(extension=ext or ".pdf", filename=filename)
@@ -507,7 +573,9 @@ def _format_display_datetime(value: str) -> str | None:
             elif 1_000_000_000 <= serial < 10_000_000_000:
                 dt = datetime.fromtimestamp(serial)
             if dt is not None and (dt.hour or dt.minute):
-                return f"{_format_display_date(parsed_date)} {dt.hour:02d}:{dt.minute:02d}"
+                return (
+                    f"{_format_display_date(parsed_date)} {dt.hour:02d}:{dt.minute:02d}"
+                )
         except ValueError:
             pass
 
@@ -522,9 +590,25 @@ def _pick_row_by_exact_date(
     headers: list[str],
     target_day: date,
 ) -> tuple[list[str] | None, str | None]:
+    matches, err = _pick_rows_by_exact_date(table, headers, target_day)
+    if err:
+        return None, err
+    if len(matches) > 1:
+        logger.info(
+            "[seminar_excel_reader] multiple rows on %s, using the first",
+            target_day,
+        )
+    return matches[0], None
+
+
+def _pick_rows_by_exact_date(
+    table: list[list],
+    headers: list[str],
+    target_day: date,
+) -> tuple[list[list[str]], str | None]:
     date_col = _find_column_for_label(headers, "时间")
     if date_col is None:
-        return None, "表格中未找到「时间/日期」列，无法按日期筛选。"
+        return [], "表格中未找到「时间/日期」列，无法按日期筛选。"
 
     matches: list[list[str]] = []
     for row in table[1:]:
@@ -535,13 +619,8 @@ def _pick_row_by_exact_date(
             matches.append(row)
 
     if not matches:
-        return None, f"没有找到日期为 {_format_date_label(target_day)} 的行。"
-    if len(matches) > 1:
-        logger.info(
-            "[seminar_excel_reader] multiple rows on %s, using the first",
-            target_day,
-        )
-    return matches[0], None
+        return [], f"没有找到日期为 {_format_date_label(target_day)} 的行。"
+    return matches, None
 
 
 def _parse_date_cell(value: str) -> date | None:
@@ -629,7 +708,36 @@ def _row_value_for_label(row: list[str], headers: list[str], label: str) -> str:
     return value.strip()
 
 
-async def _load_ppt_text(ppt_value: str) -> str:
+def _is_lark_media_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.hostname in {
+        "open.feishu.cn",
+        "open.larksuite.com",
+    } and parsed.path.startswith("/open-apis/drive/v1/medias/")
+
+
+async def _lark_media_headers(
+    context: star.Context,
+    url: str,
+    *,
+    platform_id: str | None = None,
+) -> dict[str, str]:
+    if not _is_lark_media_url(url):
+        return {}
+    lark_pair = _get_lark_client_from_context(context, platform_id=platform_id)
+    if lark_pair is None:
+        raise RuntimeError("找不到可用于下载飞书附件的 Lark 平台实例")
+    _client, lark_config = lark_pair
+    token = await asyncio.to_thread(TokenManager.get_self_tenant_token, lark_config)
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _load_ppt_text(
+    ppt_value: str,
+    context: star.Context | None = None,
+    *,
+    platform_id: str | None = None,
+) -> str:
     if not ppt_value:
         return ""
     urls = _HTTP_URL_RE.findall(ppt_value)
@@ -638,8 +746,13 @@ async def _load_ppt_text(ppt_value: str) -> str:
 
     for url in urls:
         try:
+            headers = (
+                await _lark_media_headers(context, url, platform_id=platform_id)
+                if context is not None
+                else {}
+            )
             async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as http:
-                r = await http.get(url)
+                r = await http.get(url, headers=headers)
             r.raise_for_status()
             content_type = r.headers.get("content-type", "").lower()
             filename = Path(urlparse(str(r.url)).path).name or "seminar_ppt.pdf"
@@ -652,13 +765,22 @@ async def _load_ppt_text(ppt_value: str) -> str:
             )
             if text:
                 return text
-        except Exception:
-            logger.debug(
-                "[seminar_excel_reader] failed to load PPT from %s",
-                url,
-                exc_info=True,
+        except Exception as exc:
+            logger.warning(
+                "[seminar_excel_reader] failed to load PPT attachment: %s: %s",
+                type(exc).__name__,
+                str(exc)[:300],
             )
-    return ppt_value.strip()
+    return ""
+
+
+def _reference_candidate_urls(url: str) -> list[str]:
+    parsed = urlparse(url)
+    if parsed.hostname == "openreview.net" and parsed.path.rstrip("/") == "/forum":
+        note_id = parse_qs(parsed.query).get("id", [""])[0]
+        if note_id:
+            return [f"https://openreview.net/pdf?id={quote(note_id)}", url]
+    return [url]
 
 
 async def _load_reference_text(reference_value: str) -> str:
@@ -669,18 +791,26 @@ async def _load_reference_text(reference_value: str) -> str:
     if not urls:
         return text
 
-    for url in urls:
+    candidates = [
+        candidate for url in urls for candidate in _reference_candidate_urls(url)
+    ]
+    for url in candidates:
         try:
             async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as http:
-                r = await http.get(url)
+                r = await http.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (AstrBot seminar reader)"},
+                )
             r.raise_for_status()
+            if urlparse(str(r.url)).path.rstrip("/") == "/challenge":
+                raise RuntimeError("网站要求人机验证")
             content_type = r.headers.get("content-type", "").lower()
             filename = Path(urlparse(str(r.url)).path).name or "reference.html"
-            if not Path(filename).suffix:
-                if "pdf" in content_type:
-                    filename += ".pdf"
-                elif "html" in content_type:
-                    filename += ".html"
+            suffix = Path(filename).suffix.casefold()
+            if "pdf" in content_type and suffix != ".pdf":
+                filename += ".pdf"
+            elif "html" in content_type and suffix not in {".html", ".htm"}:
+                filename += ".html"
             extracted = await asyncio.to_thread(
                 _read_markdown_from_bytes,
                 r.content,
@@ -688,50 +818,61 @@ async def _load_reference_text(reference_value: str) -> str:
             )
             if extracted:
                 return extracted
-        except Exception:
-            logger.debug(
-                "[seminar_excel_reader] failed to load reference text from %s",
-                url,
-                exc_info=True,
+        except Exception as exc:
+            logger.info(
+                "[seminar_excel_reader] paper source fetch failed for host=%s: %s: %s",
+                urlparse(url).hostname or "<unknown>",
+                type(exc).__name__,
+                str(exc)[:300],
             )
-    return text
+    return ""
 
 
-async def _summarize_paper_from_ppt(
+async def _summarize_paper_source(
     context: star.Context,
-    ppt_text: str,
+    source_text: str,
     *,
     paper_title: str = "",
     venue: str = "",
+    source_label: str = "论文材料",
+    provider_umo: str | None = None,
 ) -> str:
-    source = ppt_text.strip()
+    source = source_text.strip()
     if not source:
         return ""
-    prov = context.get_using_provider()
+    prov = context.get_using_provider(provider_umo)
     if prov is None:
+        logger.warning(
+            "[seminar_excel_reader] no chat provider available for paper summary"
+        )
         return ""
 
     source = source[:_MAX_PPT_SUMMARY_SOURCE_CHARS]
     prompt = (
-        "请根据下面的 Seminar PPT 文本，用中文概括这篇论文的大致内容。"
+        f"请根据下面的{source_label}文本，用中文概括这篇论文的大致内容。"
         "要求：只输出两句话；适合作为群通知里的“论文简介”；"
-        "不要使用项目符号，不要添加寒暄，不要编造 PPT 中没有的信息。\n\n"
+        "不要使用项目符号，不要添加寒暄，不要编造材料中没有的信息。\n\n"
     )
     if paper_title:
         prompt += f"论文标题：{paper_title}\n"
     if venue:
         prompt += f"会议/期刊：{venue}\n"
-    prompt += f"PPT 文本：\n{source}"
+    prompt += f"材料文本：\n{source}"
 
     try:
         resp = await prov.text_chat(prompt=prompt)
-    except Exception:
-        logger.debug(
-            "[seminar_excel_reader] PPT summary LLM request failed",
-            exc_info=True,
+    except Exception as exc:
+        logger.warning(
+            "[seminar_excel_reader] paper summary LLM request failed: %s: %s",
+            type(exc).__name__,
+            str(exc)[:300],
         )
         return ""
     summary = (getattr(resp, "completion_text", None) or "").strip()
+    if not summary:
+        logger.warning(
+            "[seminar_excel_reader] paper summary LLM returned empty content"
+        )
     return " ".join(summary.split())
 
 
@@ -739,75 +880,90 @@ async def _build_natural_reminder_text(
     row: list[str],
     headers: list[str],
     context: star.Context,
+    *,
+    provider_umo: str | None = None,
 ) -> str:
-    time_value = _row_value_for_label(row, headers, "时间")
+    entry = await _build_natural_reminder_entry(
+        row,
+        headers,
+        context,
+        provider_umo=provider_umo,
+    )
+    return (
+        "老师、同学们大家好，我们下一次 Seminar 将在明天进行：\n"
+        f"{entry}\n"
+        "具体的 PPT 和录屏可在 Seminar 官网 https://seu-sigmlsys.github.io/ "
+        "以及云文档中找到，欢迎各位同学参加。"
+    )
+
+
+async def _build_natural_reminder_entry(
+    row: list[str],
+    headers: list[str],
+    context: star.Context,
+    *,
+    provider_umo: str | None = None,
+) -> str:
     speaker = _row_value_for_label(row, headers, "汇报人")
-    location = _row_value_for_label(row, headers, "地点")
-    meeting_link = _row_value_for_label(row, headers, "腾讯会议链接")
     paper_title = _row_value_for_label(row, headers, "论文")
     venue = _row_value_for_label(row, headers, "会议/期刊")
     paper_link = _row_value_for_label(row, headers, "论文链接")
     ppt_value = _row_value_for_label(row, headers, "PPT")
 
-    intro = "老师、同学们大家好，我们下一次 Seminar 将在明天"
-    if time_value:
-        intro += f"（{time_value}）开始"
-    else:
-        intro += "开始"
-    if speaker:
-        intro += f"，汇报人为 {speaker}"
-    if location:
-        intro += f"，地点在 {location}"
-    intro += "。"
-
-    lines = [intro]
-    if meeting_link:
-        lines.append(f"腾讯会议链接：{meeting_link}")
-
-    paper_lines: list[str] = []
+    lines: list[str] = []
     if paper_title:
-        paper_lines.append(f"论文标题：{paper_title}")
+        lines.append(f"论文标题：{paper_title}")
     if venue:
-        paper_lines.append(f"会议/期刊：{venue}")
-    ppt_summary = ""
-    if ppt_value:
-        ppt_text = await _load_ppt_text(ppt_value)
-        ppt_summary = await _summarize_paper_from_ppt(
-            context,
-            ppt_text,
-            paper_title=paper_title,
-            venue=venue,
-        )
-    else:
-        logger.info("[seminar_excel_reader] PPT field is empty, skip PPT summary source")
-    if not ppt_summary and paper_link:
-        logger.info(
-            "[seminar_excel_reader] PPT summary unavailable, fallback to paper link text"
-        )
+        lines.append(f"会议/期刊：{venue}")
+    paper_summary = ""
+    if paper_link:
         paper_text = await _load_reference_text(paper_link)
-        ppt_summary = await _summarize_paper_from_ppt(
+        paper_summary = await _summarize_paper_source(
             context,
             paper_text,
             paper_title=paper_title,
             venue=venue,
+            source_label="论文 PDF 或网页",
+            provider_umo=provider_umo,
         )
-    if not ppt_summary:
+    else:
+        logger.info(
+            "[seminar_excel_reader] paper link is empty, skip paper summary source"
+        )
+    if not paper_summary and ppt_value:
+        logger.info(
+            "[seminar_excel_reader] paper source unavailable, fallback to PPT text"
+        )
+        platform_id = provider_umo.split(":", 1)[0] if provider_umo else None
+        ppt_text = await _load_ppt_text(
+            ppt_value,
+            context,
+            platform_id=platform_id,
+        )
+        paper_summary = await _summarize_paper_source(
+            context,
+            ppt_text,
+            paper_title=paper_title,
+            venue=venue,
+            source_label="Seminar PPT",
+            provider_umo=provider_umo,
+        )
+    if not paper_summary and (paper_link or ppt_value):
         logger.warning(
             "[seminar_excel_reader] failed to build paper summary for title=%s",
             paper_title or "<empty>",
         )
-    if ppt_summary:
-        paper_lines.append(f"论文简介：{ppt_summary}")
+    elif not paper_summary:
+        logger.info(
+            "[seminar_excel_reader] no paper or PPT source for title=%s; skip summary",
+            paper_title or "<empty>",
+        )
+    if paper_summary:
+        lines.append(f"论文简介：{paper_summary}")
     if paper_link:
-        paper_lines.append(f"论文链接：{paper_link}")
-    if paper_lines:
-        lines.append("下面是本次分享的论文基础信息：")
-        lines.extend(paper_lines)
-
-    lines.append(
-        "具体的 PPT 和录屏可在 Seminar 官网 https://seu-sigmlsys.github.io/ "
-        "以及云文档中找到，欢迎各位同学参加。"
-    )
+        lines.append(f"论文链接：{paper_link}")
+    if speaker:
+        lines.append(f"汇报人：{speaker}")
     return "\n".join(lines)
 
 
@@ -1075,7 +1231,9 @@ async def _read_bitable_seminar_values(
     *,
     table_id: str | None = None,
 ) -> tuple[list[list], str] | None:
-    tenant_token = await asyncio.to_thread(TokenManager.get_self_tenant_token, lark_config)
+    tenant_token = await asyncio.to_thread(
+        TokenManager.get_self_tenant_token, lark_config
+    )
     api_base = _lark_api_base(client)
 
     tables_data = await _bitable_get(
@@ -1192,9 +1350,15 @@ def _reminder_labels(plugin_cfg: AstrBotConfig | dict | None) -> list[str]:
 
 def _get_lark_client_from_context(
     context: star.Context,
+    *,
+    platform_id: str | None = None,
 ) -> tuple[lark.Client, Config] | None:
-    for inst in context.platform_manager.platform_insts:
+    platform_manager = getattr(context, "platform_manager", None)
+    platform_insts = getattr(platform_manager, "platform_insts", ())
+    for inst in platform_insts:
         if inst.meta().name != "lark":
+            continue
+        if platform_id and inst.meta().id != platform_id:
             continue
         api = getattr(inst, "lark_api", None)
         if api is None:
@@ -1244,6 +1408,7 @@ async def _build_tomorrow_reminder_text(
     values: list[list],
     *,
     reference_day: date | None = None,
+    provider_umo: str | None = None,
 ) -> str | None:
     table = _trim_table(values)
     if len(table) < 2:
@@ -1252,10 +1417,90 @@ async def _build_tomorrow_reminder_text(
     tomorrow = _resolve_relative_target_date("明天", reference_day=reference_day)
     if tomorrow is None:
         return None
-    row, err = _pick_row_by_exact_date(table, headers, tomorrow)
-    if err or row is None:
+    rows, err = _pick_rows_by_exact_date(table, headers, tomorrow)
+    if err or not rows:
         return None
-    return await _build_natural_reminder_text(row, headers, context)
+
+    time_value = _row_value_for_label(rows[0], headers, "时间")
+    location = next(
+        (
+            value
+            for row in rows
+            if (value := _row_value_for_label(row, headers, "地点"))
+        ),
+        "",
+    )
+    meeting_link = next(
+        (
+            value
+            for row in rows
+            if (value := _row_value_for_label(row, headers, "腾讯会议链接"))
+        ),
+        "",
+    )
+    speakers = [
+        speaker
+        for row in rows
+        if (speaker := _row_value_for_label(row, headers, "汇报人"))
+    ]
+
+    opening = "老师、同学们大家好，我们下一次 Seminar 将在明天"
+    if time_value:
+        opening += f"（{time_value}）"
+    opening += f"开始，共有{len(rows)}人汇报"
+    if speakers:
+        opening += f"，分别是：{'、'.join(speakers)}"
+    if location:
+        opening += f"，地点在 {location}"
+    opening += "。"
+
+    lines = [opening]
+    if meeting_link:
+        lines.append(f"腾讯会议链接：{meeting_link}")
+    lines.append("下面是本次分享的论文基础信息：")
+    entries = [
+        await _build_natural_reminder_entry(
+            row,
+            headers,
+            context,
+            provider_umo=provider_umo,
+        )
+        for row in rows
+    ]
+    lines.append("\n\n".join(entry for entry in entries if entry))
+    lines.append(
+        "具体的 PPT 和录屏可在 Seminar 官网 https://seu-sigmlsys.github.io/ "
+        "以及云文档中找到，欢迎各位同学参加。"
+    )
+    return "\n".join(line for line in lines if line)
+
+
+async def _build_tomorrow_reminder_texts(
+    context: star.Context,
+    values: list[list],
+    *,
+    reference_day: date | None = None,
+    provider_umo: str | None = None,
+) -> list[str]:
+    table = _trim_table(values)
+    if len(table) < 2:
+        return []
+    headers = table[0]
+    tomorrow = _resolve_relative_target_date("明天", reference_day=reference_day)
+    if tomorrow is None:
+        return []
+    rows, err = _pick_rows_by_exact_date(table, headers, tomorrow)
+    if err:
+        return []
+    return [
+        await _build_natural_reminder_entry(
+            row,
+            headers,
+            context,
+            provider_umo=provider_umo,
+        )
+        for row in rows
+    ]
 
 
 async def send_tomorrow_seminar_reminder(
@@ -1280,6 +1525,7 @@ async def send_tomorrow_seminar_reminder(
         context,
         values,
         reference_day=reference_day,
+        provider_umo=session,
     )
     if not body:
         tomorrow = (reference_day or date.today()) + timedelta(days=1)
@@ -1295,11 +1541,17 @@ async def send_tomorrow_seminar_reminder(
             )
             return False
 
-    reminder_text = f"{body}\n"
-    sent = await context.send_message(
-        session,
-        MessageChain().message(reminder_text).at_all(),
-    )
+    try:
+        sent = await context.send_message(
+            session,
+            MessageChain().message(f"{body}\n").at_all(),
+        )
+    except Exception:
+        logger.exception(
+            "[seminar_excel_reader] failed to send tomorrow reminder to %s",
+            session,
+        )
+        return False
     if sent:
         logger.info("[seminar_excel_reader] sent tomorrow reminder to %s", session)
     else:

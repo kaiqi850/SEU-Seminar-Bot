@@ -157,6 +157,21 @@ class LarkPlatformAdapter(Platform):
             builder = builder.register_p2_im_chat_member_user_added_v1(
                 do_v2_member_join_event
             )
+        # Reactions are not converted to AstrBot messages, but Feishu may still
+        # deliver subscribed reaction events over the WebSocket connection.
+        if hasattr(builder, "register_p2_im_message_reaction_created_v1"):
+            builder = builder.register_p2_im_message_reaction_created_v1(
+                lambda _event: None
+            )
+        if hasattr(builder, "register_p2_im_message_reaction_deleted_v1"):
+            builder = builder.register_p2_im_message_reaction_deleted_v1(
+                lambda _event: None
+            )
+        # Opening a bot P2P chat is a lifecycle event, not a user message.
+        if hasattr(builder, "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1"):
+            builder = builder.register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
+                lambda _event: None
+            )
         self.event_handler = builder.build()
 
         self.do_v2_msg_event = do_v2_msg_event
